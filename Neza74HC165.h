@@ -1,32 +1,86 @@
+
 // Neza74HC165.h
 #ifndef Neza74HC165_h
 #define Neza74HC165_h
 
 #include <Arduino.h>
 
-// HC165_Flags Template Class
+// ======================= Clock Delay Configuration =======================
+// Set dual-phase delays to control the bit-banged clock frequency.
+// If you want ~100 kHz, use 5 + 5 µs (10 µs period).
+// If you want ~200 kHz, use ~2 + 3 µs (≈5 µs period).
+// If you want ~300 kHz, use ~1 + 2 µs (≈3 µs period).
+#ifndef NEZA_74HC165_DELAY_HIGH
+#define NEZA_74HC165_DELAY_HIGH 5  // microseconds while CLK is HIGH
+#endif
+#ifndef NEZA_74HC165_DELAY_LOW
+#define NEZA_74HC165_DELAY_LOW  5  // microseconds while CLK is LOW
+#endif
+
+// Optional: small latch pulse delay during /PL (parallel load).
+#ifndef NEZA_74HC165_LATCH_PULSE_US
+#define NEZA_74HC165_LATCH_PULSE_US 1  // microseconds
+#endif
+
+// ======================= Optional Fast GPIO for ESP32 =====================
+// On ESP32-class MCUs (including ESP32-C6), direct ESP-IDF GPIO calls can
+// reduce overhead and jitter compared to digitalWrite/digitalRead.
+// Enable by defining NEZA_USE_ESP32_FAST_GPIO (or leave undefined to use
+// Arduino GPIO APIs).
+#if defined(ARDUINO_ARCH_ESP32)
+  #ifdef NEZA_USE_ESP32_FAST_GPIO
+    #include "driver/gpio.h"
+    inline void neza_gpio_set_level(int pin, int level) {
+      gpio_set_level((gpio_num_t)pin, level);
+    }
+    inline int neza_gpio_get_level(int pin) {
+      return gpio_get_level((gpio_num_t)pin);
+    }
+    inline void neza_gpio_init_out(int pin, int initial) {
+      gpio_reset_pin((gpio_num_t)pin);
+      gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+      gpio_set_level((gpio_num_t)pin, initial);
+    }
+    inline void neza_gpio_init_in(int pin) {
+      gpio_reset_pin((gpio_num_t)pin);
+      gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+    }
+  #else
+    inline void neza_gpio_set_level(int pin, int level) { digitalWrite(pin, level); }
+    inline int  neza_gpio_get_level(int pin) { return digitalRead(pin); }
+    inline void neza_gpio_init_out(int pin, int initial) {
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, initial);
+    }
+    inline void neza_gpio_init_in(int pin) {
+      pinMode(pin, INPUT);
+    }
+  #endif
+#else
+  inline void neza_gpio_set_level(int pin, int level) { digitalWrite(pin, level); }
+  inline int  neza_gpio_get_level(int pin) { return digitalRead(pin); }
+  inline void neza_gpio_init_out(int pin, int initial) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, initial);
+  }
+  inline void neza_gpio_init_in(int pin) {
+    pinMode(pin, INPUT);
+  }
+#endif
+
+// ============================ HC165_Flags ============================
 template <typename T>
 class HC165_Flags {
 private:
     T flags;
 public:
-    HC165_Flags() {
-        reset();
-    }
-    bool read(uint8_t bit) {
-        return bitRead(flags, bit);
-    }
-    void write(uint8_t bit, bool value) {
-        bitWrite(flags, bit, value);
-    }
-    void on(uint8_t bit) {
-        bitWrite(flags, bit, 1);
-    }
-    void off(uint8_t bit) {
-        bitWrite(flags, bit, 0);
-    }
+    HC165_Flags() { reset(); }
+    bool read(uint8_t bit) { return bitRead(flags, bit); }
+    void write(uint8_t bit, bool value) { bitWrite(flags, bit, value); }
+    void on(uint8_t bit) { bitWrite(flags, bit, 1); }
+    void off(uint8_t bit) { bitWrite(flags, bit, 0); }
     bool toggle(uint8_t bit) {
-        flags ^= 1UL << bit;
+        flags ^= static_cast<T>(1UL << bit);
         return bitRead(flags, bit);
     }
     bool toggleIfTrue(uint8_t bit) {
@@ -36,76 +90,87 @@ public:
         }
         return false;
     }
-    void reset() {
-        flags = 0;
-    }
-    void set(T t_flags) {
-        flags = t_flags;
-    }
-    T get() {
-        return flags;
-    }
+    void reset() { flags = 0; }
+    void set(T t_flags) { flags = t_flags; }
+    T get() { return flags; }
 };
 
-// Neza74HC165 Constants and Classes
-#define NEZA_74HC165_DELAY 1
-
+// ============================ Neza74HC165 ============================
+// Bit-banged (GPIO) 74HC165 reader with tunable clock delays.
 template <uint8_t _muxCount>
 class Neza74HC165 {
 private:
     uint8_t clkPin = 0;
-    uint8_t loadPin = 0;
-    uint8_t dataPin = 0;
-    uint8_t states[_muxCount];
+    uint8_t loadPin = 0; // /PL (active low)
+    uint8_t dataPin = 0; // Q7
+    uint8_t states[_muxCount]; // one byte per chip
 public:
     Neza74HC165() {}
+
+    // Order: begin(dataPin (Q7), loadPin (/PL), clkPin (CP))
     void begin(uint8_t t_data, uint8_t t_load, uint8_t t_clk) {
         if (t_clk == t_load || t_clk == t_data || t_load == t_data) {
             Serial.println("invalid 74HC165 pins used");
-            while (1);
+            while (1) { /* halt */ }
         }
-        clkPin = t_clk;
+        clkPin  = t_clk;
         loadPin = t_load;
         dataPin = t_data;
-        pinMode(clkPin, OUTPUT);
-        pinMode(loadPin, OUTPUT);
-        pinMode(dataPin, INPUT);
-        digitalWrite(clkPin, LOW);
-        digitalWrite(loadPin, HIGH);
-        memset(states, 0, sizeof(states[0]) * _muxCount);
+
+        // Initialize pins (fast path if enabled on ESP32, otherwise Arduino API)
+        neza_gpio_init_out(clkPin, LOW);
+        neza_gpio_init_out(loadPin, HIGH);
+        neza_gpio_init_in(dataPin);
+
+        memset(states, 0, sizeof(states));
     }
-    uint16_t getLength() {
-        return _muxCount * 8;
-    }
+
+    uint16_t getLength() { return _muxCount * 8; }
+
+    // Latch + shift out all bytes with dual-phase delays
     void update() {
-        digitalWrite(loadPin, LOW);
-        delayMicroseconds(NEZA_74HC165_DELAY);
-        digitalWrite(loadPin, HIGH);
+        // Parallel load: /PL low → latch → high
+        neza_gpio_set_level(loadPin, LOW);
+        delayMicroseconds(NEZA_74HC165_LATCH_PULSE_US);
+        neza_gpio_set_level(loadPin, HIGH);
+        // (Optionally, small settling delay)
+        // delayMicroseconds(NEZA_74HC165_LATCH_PULSE_US);
+
         for (uint8_t mux = 0; mux < _muxCount; mux++) {
+            // Read 8 bits MSB..LSB as originally implemented
             for (int i = 7; i >= 0; i--) {
-                uint8_t bit = digitalRead(dataPin);
+                // Sample current bit from Q7 before clock edge
+                uint8_t bit = neza_gpio_get_level(dataPin);
                 bitWrite(states[mux], i, bit);
-                digitalWrite(clkPin, HIGH);
-                delayMicroseconds(NEZA_74HC165_DELAY);
-                digitalWrite(clkPin, LOW);
+
+                // Clock HIGH phase
+                neza_gpio_set_level(clkPin, HIGH);
+                delayMicroseconds(NEZA_74HC165_DELAY_HIGH);
+
+                // Clock LOW phase
+                neza_gpio_set_level(clkPin, LOW);
+                delayMicroseconds(NEZA_74HC165_DELAY_LOW);
             }
         }
     }
+
+    // Read flattened index n (0.._muxCount*8-1)
     bool read(uint16_t n) {
         if (n >= (_muxCount * 8)) {
-            return HIGH;
+            return HIGH; // out-of-range guard; keep legacy behavior
         }
         return bitRead(states[(n >> 3)], (n & 0x07));
     }
-    bool readPin(uint16_t n) {
-        return read(n);
-    }
+
+    bool readPin(uint16_t n) { return read(n); }
 };
 
+// Preserve your alias template (2x chips)
 template <uint8_t _muxinCount>
 class HC165_165 : public Neza74HC165<_muxinCount * 2> {};
 
-// HC165_Button Constants and Class
+// ============================ HC165_Button ============================
+// Button/PIR state machine as provided (unchanged except includes and context).
 #define NEZA_BTN_STATE                 0
 #define NEZA_BTN_STATE_CHANGED         1
 #define NEZA_BTN_STATE_HELD            2
@@ -130,9 +195,13 @@ private:
     uint16_t doublePressTime = 0;
     HC165_Flags<uint8_t> flags;
     void (*onUpdateCallback)(uint8_t type);
+
+    // NOTE: originally private. If you want to set callbacks from user code,
+    // move this to public or add a public wrapper like setOnUpdate(...).
     void onUpdate(void (*fptr)(uint8_t type)) {
         onUpdateCallback = fptr;
     }
+
     bool isPressed() {
         return flags.read(NEZA_BTN_STATE);
     }
@@ -276,4 +345,4 @@ public:
     }
 };
 
-#endif
+#endif // Neza74HC165_h
