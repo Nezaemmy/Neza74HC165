@@ -310,36 +310,40 @@ public:
   }
 
   void updateWithCallback(bool state,
-                          uint16_t t_debounce = 50,
-                          bool t_logic = LOW,
-                          uint16_t t_hold = NEZA_BTN_HOLD_THRESH,
-                          bool ignoreAfterHold = false)
-  {
-    if (update(state, t_debounce, t_logic) && onUpdateCallback) {
-      read(t_hold, ignoreAfterHold);
+                        uint16_t t_debounce = 50,
+                        bool t_logic = LOW,
+                        uint16_t t_hold = NEZA_BTN_HOLD_THRESH,
+                        bool ignoreAfterHold = false)
+{
+  update(state, t_debounce, t_logic);
+
+  if (onUpdateCallback) {
+    read(t_hold, ignoreAfterHold);
+  }
+}
+
+
+  uint8_t read(uint16_t t_hold = NEZA_BTN_HOLD_THRESH, bool ignoreAfterHold = false) {
+  if (held(t_hold)) {
+    if (onUpdateCallback) onUpdateCallback(NEZA_HELD);
+    return NEZA_HELD;
+  }
+
+  if (stateChanged_()) {
+    if (doublePressed()) {
+      if (onUpdateCallback) onUpdateCallback(NEZA_DOUBLE);
+      return NEZA_DOUBLE;
+    } else if (isPressed_()) {
+      if (onUpdateCallback) onUpdateCallback(NEZA_PRESSED);
+      return NEZA_PRESSED;
+    } else if (released(ignoreAfterHold)) {
+      if (onUpdateCallback) onUpdateCallback(NEZA_RELEASED);
+      return NEZA_RELEASED;
     }
   }
 
-  uint8_t read(uint16_t t_hold = NEZA_BTN_HOLD_THRESH, bool ignoreAfterHold = false) {
-    if (stateChanged_()) {
-      if (held(t_hold)) {
-        if (onUpdateCallback) onUpdateCallback(NEZA_HELD);
-        return NEZA_HELD;
-      } else {
-        if (doublePressed()) {
-          if (onUpdateCallback) onUpdateCallback(NEZA_DOUBLE);
-          return NEZA_DOUBLE;
-        } else if (isPressed_()) {
-          if (onUpdateCallback) onUpdateCallback(NEZA_PRESSED);
-          return NEZA_PRESSED;
-        } else if (released(ignoreAfterHold)) {
-          if (onUpdateCallback) onUpdateCallback(NEZA_RELEASED);
-          return NEZA_RELEASED;
-        }
-      }
-    }
-    return NEZA_NONE;
-  }
+  return NEZA_NONE;
+}
 
   bool doublePressed(bool allowRelease = false) {
     bool state = flags.toggleIfTrue(NEZA_BTN_STATE_DBL_TRIGGERED);
@@ -399,3 +403,4 @@ public:
 };
 
 #endif // Neza74HC165_h
+
