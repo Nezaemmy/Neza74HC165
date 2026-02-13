@@ -108,6 +108,7 @@ public:
 
 template <uint8_t _muxCount>
 class Neza74HC165 {
+static_assert(_muxCount > 0, "_muxCount must be > 0");
 public:
   enum class BitOrder : uint8_t { MSB_FIRST = 0, LSB_FIRST = 1 };
   enum class Logic    : uint8_t { Normal = 0, Inverted = 1 };
@@ -193,12 +194,11 @@ public:
     }
   }
 
-  bool read(uint16_t n) const {
-    if (n >= ((uint16_t)_muxCount * 8)) {
-      return false;
-    }
-    return bitRead(states[(n >> 3)], (n & 0x07));
-  }
+  bool tryRead(uint16_t n, bool &value) const {
+  if (n >= (uint16_t)_muxCount * 8) return false;
+  value = bitRead(states[n >> 3], n & 0x07);
+  return true;
+}
 
   bool readPin(uint16_t n) const { return read(n); }
 
@@ -403,4 +403,5 @@ public:
 };
 
 #endif // Neza74HC165_h
+
 
