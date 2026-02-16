@@ -194,13 +194,12 @@ public:
     }
   }
 
-  bool tryRead(uint16_t n, bool &value) const {
-  if (n >= (uint16_t)_muxCount * 8) return false;
-  value = bitRead(states[n >> 3], n & 0x07);
-  return true;
+  bool read(uint16_t n) const {
+  if (n >= ((uint16_t)_muxCount * 8)) return false;
+  return bitRead(states[n >> 3], n & 0x07);
 }
 
-  bool readPin(uint16_t n) const { return read(n); }
+bool readPin(uint16_t n) const { return this->read(n); }
 
   // Convenience: raw byte access
   uint8_t readByte(uint8_t chip) const {
@@ -403,5 +402,6 @@ public:
 };
 
 #endif // Neza74HC165_h
+
 
 
