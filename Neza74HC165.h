@@ -1,5 +1,3 @@
-
-
 #ifndef Neza74HC165_h
 #define Neza74HC165_h
 
@@ -8,56 +6,41 @@
 
 // ======================= Clock Delay Configuration =======================
 // Dual-phase delays to control bit-banged clock frequency.
-// If you want ~100 kHz, use 5 + 5 µs (10 µs period).
-// If you want ~200 kHz, use ~2 + 3 µs (≈5 µs period).
-// If you want ~300 kHz, use ~1 + 2 µs (≈3 µs period).
+// ~100 kHz: 5 + 5 µs | ~200 kHz: 2 + 3 µs | ~300 kHz: 1 + 2 µs
 #ifndef NEZA_74HC165_DELAY_HIGH
-#define NEZA_74HC165_DELAY_HIGH 5  // microseconds while CLK is HIGH
+#define NEZA_74HC165_DELAY_HIGH 5   // µs while CLK is HIGH
 #endif
 #ifndef NEZA_74HC165_DELAY_LOW
-#define NEZA_74HC165_DELAY_LOW  5  // microseconds while CLK is LOW
+#define NEZA_74HC165_DELAY_LOW  5   // µs while CLK is LOW
 #endif
 
-// Optional: small latch pulse delay during /PL (parallel load).
+// Small latch pulse during /PL (parallel load)
 #ifndef NEZA_74HC165_LATCH_PULSE_US
-#define NEZA_74HC165_LATCH_PULSE_US 1  // microseconds
+#define NEZA_74HC165_LATCH_PULSE_US 1
 #endif
 
-// ======================= Optional Fast GPIO for ESP32 =====================
-// Enable by defining NEZA_USE_ESP32_FAST_GPIO.
-// Uses ESP-IDF driver/gpio for lower overhead/jitter.
-#if defined(ARDUINO_ARCH_ESP32)
-  #ifdef NEZA_USE_ESP32_FAST_GPIO
-    #include "driver/gpio.h"
-    inline void neza_gpio_set_level(int pin, int level) {
-      gpio_set_level((gpio_num_t)pin, level);
-    }
-    inline int neza_gpio_get_level(int pin) {
-      return gpio_get_level((gpio_num_t)pin);
-    }
-    inline void neza_gpio_init_out(int pin, int initial) {
-      gpio_reset_pin((gpio_num_t)pin);
-      gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
-      gpio_set_level((gpio_num_t)pin, initial);
-    }
-    inline void neza_gpio_init_in(int pin) {
-      gpio_reset_pin((gpio_num_t)pin);
-      gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
-    }
-  #else
-    inline void neza_gpio_set_level(int pin, int level) { digitalWrite(pin, level); }
-    inline int  neza_gpio_get_level(int pin) { return digitalRead(pin); }
-    inline void neza_gpio_init_out(int pin, int initial) {
-      pinMode(pin, OUTPUT);
-      digitalWrite(pin, initial);
-    }
-    inline void neza_gpio_init_in(int pin) {
-      pinMode(pin, INPUT);
-    }
-  #endif
+// ======================= Optional Fast GPIO for ESP32 ====================
+// Enable with: #define NEZA_USE_ESP32_FAST_GPIO
+#if defined(ARDUINO_ARCH_ESP32) && defined(NEZA_USE_ESP32_FAST_GPIO)
+  #include "driver/gpio.h"
+  inline void neza_gpio_set_level(int pin, int level) {
+    gpio_set_level((gpio_num_t)pin, level);
+  }
+  inline int neza_gpio_get_level(int pin) {
+    return gpio_get_level((gpio_num_t)pin);
+  }
+  inline void neza_gpio_init_out(int pin, int initial) {
+    gpio_reset_pin((gpio_num_t)pin);
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)pin, initial);
+  }
+  inline void neza_gpio_init_in(int pin) {
+    gpio_reset_pin((gpio_num_t)pin);
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+  }
 #else
   inline void neza_gpio_set_level(int pin, int level) { digitalWrite(pin, level); }
-  inline int  neza_gpio_get_level(int pin) { return digitalRead(pin); }
+  inline int  neza_gpio_get_level(int pin)            { return digitalRead(pin); }
   inline void neza_gpio_init_out(int pin, int initial) {
     pinMode(pin, OUTPUT);
     digitalWrite(pin, initial);
@@ -68,340 +51,381 @@
 #endif
 
 
-// ============================ HC165_Flags ============================
+// ============================ HC165_Flags ====================================
+// Generic bit-flag wrapper around any unsigned integer type.
+// ============================================================================
 template <typename T>
 class HC165_Flags {
 private:
-  T flags;
+  T flags = 0;
+
 public:
   HC165_Flags() { reset(); }
 
+  // ── Readers ──────────────────────────────────────────────────────────────
   bool read(uint8_t bit) const { return bitRead(flags, bit); }
-  T get() const { return flags; }
+  T    get()             const { return flags; }
 
-  // mutators
+  // ── Mutators ─────────────────────────────────────────────────────────────
   void write(uint8_t bit, bool value) { bitWrite(flags, bit, value); }
-  void on(uint8_t bit) { bitWrite(flags, bit, 1); }
-  void off(uint8_t bit) { bitWrite(flags, bit, 0); }
+  void on(uint8_t bit)                { bitWrite(flags, bit, 1); }
+  void off(uint8_t bit)               { bitWrite(flags, bit, 0); }
 
   bool toggle(uint8_t bit) {
     flags ^= static_cast<T>(1UL << bit);
     return bitRead(flags, bit);
   }
 
-  bool toggleIfTrue(uint8_t bit) {
+  bool consumeIfSet(uint8_t bit) {
     if (bitRead(flags, bit)) {
       bitClear(flags, bit);
       return true;
     }
     return false;
   }
+  // Backward-compat alias
+  bool toggleIfTrue(uint8_t bit) { return consumeIfSet(bit); }
 
-  void reset() { flags = 0; }
-  void set(T t_flags) { flags = t_flags; }
+  void reset()    { flags = 0; }
+  void set(T val) { flags = val; }
 };
 
 
-// ============================ Neza74HC165 ============================
-// Bit-banged (GPIO) 74HC165 reader with tunable clock delays.
-//
-
+// ============================ Neza74HC165 ====================================
+// Bit-banged (GPIO) 74HC165 chain reader.
+// _muxCount = number of daisy-chained ICs (each contributes 8 bits).
+// ============================================================================
 template <uint8_t _muxCount>
 class Neza74HC165 {
-static_assert(_muxCount > 0, "_muxCount must be > 0");
+  static_assert(_muxCount > 0, "_muxCount must be > 0");
+
 public:
   enum class BitOrder : uint8_t { MSB_FIRST = 0, LSB_FIRST = 1 };
   enum class Logic    : uint8_t { Normal = 0, Inverted = 1 };
 
 private:
   uint8_t clkPin  = 0;
-  uint8_t loadPin = 0; // /PL (active low)
-  uint8_t dataPin = 0; // Q7
+  uint8_t loadPin = 0;   // /PL — active low
+  uint8_t dataPin = 0;   // Q7 serial output
 
-  BitOrder bitOrder_ = BitOrder::MSB_FIRST;
-  Logic    logic_    = Logic::Normal;
+  BitOrder bitOrder_   = BitOrder::MSB_FIRST;
+  Logic    logic_      = Logic::Normal;
+  bool     initialized_ = false;
 
-  uint8_t states[_muxCount]; // one byte per chip
+  uint8_t states[_muxCount] = {};   // one byte per IC
 
 public:
   Neza74HC165() {}
 
-  // Order: begin(dataPin (Q7), loadPin (/PL), clkPin (CP))
+  // begin(dataPin/Q7, loadPin//PL, clkPin/CP, bitOrder, logic)
+  // Returns false if any two pins share the same number.
   bool begin(uint8_t t_data, uint8_t t_load, uint8_t t_clk,
-             BitOrder order, Logic logic)
+             BitOrder order = BitOrder::MSB_FIRST,
+             Logic    logic = Logic::Normal)
   {
-    // Validate pin uniqueness
     if (t_clk == t_load || t_clk == t_data || t_load == t_data) {
-      return false;
+      return false;  // pins must be unique
     }
 
-    clkPin  = t_clk;
-    loadPin = t_load;
-    dataPin = t_data;
+    clkPin    = t_clk;
+    loadPin   = t_load;
+    dataPin   = t_data;
     bitOrder_ = order;
     logic_    = logic;
 
-    // Init pins
-    neza_gpio_init_out(clkPin, LOW);
+    neza_gpio_init_out(clkPin,  LOW);
     neza_gpio_init_out(loadPin, HIGH);
     neza_gpio_init_in(dataPin);
 
     std::memset(states, 0, sizeof(states));
+    initialized_ = true;
 
-    // Read initial state immediately so first reads are real
+    // Capture real initial state so first reads are meaningful
     update();
     return true;
   }
 
+  // Convenience overload (MSB-first, normal logic)
   bool begin(uint8_t t_data, uint8_t t_load, uint8_t t_clk) {
     return begin(t_data, t_load, t_clk, BitOrder::MSB_FIRST, Logic::Normal);
   }
 
-  // Runtime configuration helpers (optional)
+  // ── Runtime configuration ─────────────────────────────────────────────────
   void setBitOrder(BitOrder order) { bitOrder_ = order; }
-  void setLogic(Logic logic)       { logic_ = logic; }
+  void setLogic(Logic logic)       { logic_    = logic; }
 
-  uint16_t getLength() const { return (uint16_t)_muxCount * 8; }
+  uint16_t getLength() const { return static_cast<uint16_t>(_muxCount) * 8u; }
 
-  // Latch + shift out all bytes with dual-phase delays
+  // ── Latch + shift all bytes with dual-phase clock delays ──────────────────
+  // Call once per main loop iteration.
   void update() {
-    // Parallel load: /PL low → latch → high
+    if (!initialized_) return;
+
+    // Parallel load: drive /PL low briefly, then high to latch inputs
     neza_gpio_set_level(loadPin, LOW);
     delayMicroseconds(NEZA_74HC165_LATCH_PULSE_US);
     neza_gpio_set_level(loadPin, HIGH);
 
+    // Read each IC in chain order (leftmost/first IC = states[0])
     for (uint8_t mux = 0; mux < _muxCount; mux++) {
-      // Read 8 bits from Q7; sample BEFORE clock edge (common 165 pattern)
+      // Sample BEFORE clock edge — standard 74HC165 timing
       for (int i = 7; i >= 0; i--) {
-        uint8_t bit = (uint8_t)neza_gpio_get_level(dataPin) & 0x01;
+        uint8_t bit = static_cast<uint8_t>(neza_gpio_get_level(dataPin)) & 0x01;
 
         if (logic_ == Logic::Inverted) bit ^= 1;
 
-        uint8_t targetBit = (bitOrder_ == BitOrder::MSB_FIRST)
-                              ? (uint8_t)i
-                              : (uint8_t)(7 - i);
+        const uint8_t targetBit = (bitOrder_ == BitOrder::MSB_FIRST)
+                                    ? static_cast<uint8_t>(i)
+                                    : static_cast<uint8_t>(7 - i);
 
         bitWrite(states[mux], targetBit, bit);
 
-        // Clock HIGH phase
         neza_gpio_set_level(clkPin, HIGH);
         delayMicroseconds(NEZA_74HC165_DELAY_HIGH);
-
-        // Clock LOW phase
         neza_gpio_set_level(clkPin, LOW);
         delayMicroseconds(NEZA_74HC165_DELAY_LOW);
       }
     }
   }
 
+  // ── Bit access ────────────────────────────────────────────────────────────
+
+  // Read bit n across the entire chain (0 = first bit of first IC).
   bool read(uint16_t n) const {
-  if (n >= ((uint16_t)_muxCount * 8)) return false;
-  return bitRead(states[n >> 3], n & 0x07);
-}
-
-bool readPin(uint16_t n) const { return this->read(n); }
-
-  // Convenience: raw byte access
-  uint8_t readByte(uint8_t chip) const {
-    return (chip < _muxCount) ? states[chip] : 0;
+    if (n >= getLength()) return false;
+    return bitRead(states[n >> 3], n & 0x07);
   }
+
+  bool readPin(uint16_t n) const { return read(n); }
+
+  // Raw byte for IC index `chip` (0-based).
+  uint8_t readByte(uint8_t chip) const {
+    return (chip < _muxCount) ? states[chip] : 0u;
+  }
+
+  // Pointer to the raw state buffer (use with care — volatile between update calls).
   const uint8_t* data() const { return states; }
 };
 
-// Preserve alias template (2x chips)
+
+// Each HC165_165<N> manages N*2 physical 74HC165 chips = N*16 input bits.
 template <uint8_t _muxinCount>
 class HC165_165 : public Neza74HC165<_muxinCount * 2> {};
 
 
-// ============================ HC165_Button ============================
-// Button/PIR state machine with:
-//  - default doublePressTime
-//  - public callback setter
-//  - fewer millis() calls
-#define NEZA_BTN_STATE                 0
-#define NEZA_BTN_STATE_CHANGED         1
-#define NEZA_BTN_STATE_HELD            2
-#define NEZA_BTN_STATE_HOLD_TRIGGERED  3
-#define NEZA_BTN_STATE_DBL_ACTIVE      4
-#define NEZA_BTN_STATE_DBL_TRIGGERED   5
-#define NEZA_BTN_STATE_DBL_IGNORE_REL  6
+// ============================ HC165_Button ===================================
 
+
+// ── Thresholds ───────────────────────────────────────────────────────────────
 #ifndef NEZA_BTN_HOLD_THRESH
-#define NEZA_BTN_HOLD_THRESH   500
+#define NEZA_BTN_HOLD_THRESH    500   // ms until press becomes "held"
 #endif
-
 #ifndef NEZA_BTN_DBL_DEFAULT
-#define NEZA_BTN_DBL_DEFAULT   350
+#define NEZA_BTN_DBL_DEFAULT    350   // ms window to catch second press
 #endif
 
+// ── Event return codes ────────────────────────────────────────────────────────
 #define NEZA_NONE      0
 #define NEZA_RELEASED  1
 #define NEZA_PRESSED   2
 #define NEZA_HELD      3
 #define NEZA_DOUBLE    4
 
+// ── Active-level enum 
+enum class ActiveLevel : uint8_t {
+  Low  = 0,   // button grounds the line when pressed  (most common)
+  High = 1,   // button drives the line high when pressed
+};
+
+// ── Internal flag indices ─────────────────────────────────────────────────────
+#define BTN_FLAG_STATE      0   // current debounced state (1 = pressed)
+#define BTN_FLAG_CHANGED    1   // state changed this update cycle
+#define BTN_FLAG_HOLD_ARMED 2   // waiting for hold threshold
+#define BTN_FLAG_HOLD_FIRED 3   // hold event has already fired this press
+
 class HC165_Button {
-private:
-  uint32_t debounce = 0;
-  uint32_t holdDebounce = 0;
-  uint32_t dblDebounce = 0;
-  uint16_t doublePressTime = NEZA_BTN_DBL_DEFAULT;
-
-  HC165_Flags<uint8_t> flags;
-  void (*onUpdateCallback)(uint8_t type) = nullptr;
-
-  bool isPressed_() const { return flags.read(NEZA_BTN_STATE); }
-  bool stateChanged_() const { return flags.read(NEZA_BTN_STATE_CHANGED); }
-  bool btnHeld_() const { return flags.read(NEZA_BTN_STATE_HELD); }
-
-  bool setDblPress_(uint32_t now) {
-    if (flags.toggleIfTrue(NEZA_BTN_STATE_DBL_ACTIVE)) {
-      if ((uint32_t)(now - dblDebounce) <= (uint32_t)doublePressTime) {
-        flags.on(NEZA_BTN_STATE_DBL_TRIGGERED);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  void setDblRelease_(uint32_t now) {
-    if (!flags.read(NEZA_BTN_STATE_DBL_ACTIVE)) {
-      flags.on(NEZA_BTN_STATE_DBL_ACTIVE);
-      dblDebounce = now;
-    }
-  }
-
 public:
-  HC165_Button() {
-    flags.reset();
-  }
+
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
+  HC165_Button() = default;
 
   void begin() {
-    debounce = millis();
+    flags_.reset();
+    dblState_      = DblState::IDLE;
+    debounceTs_    = millis();
+    holdTs_        = 0;
+    dblWindowTs_   = 0;
+    lastEvent_     = NEZA_NONE;
+    initialized_   = true;
   }
 
-  //  public callback setter
-  void setOnUpdate(void (*fptr)(uint8_t type)) {
-    onUpdateCallback = fptr;
+  // ── Configuration ──────────────────────────────────────────────────────────
+  void setOnUpdate(void (*fptr)(uint8_t type)) { callback_ = fptr; }
+  void setDoublePressThreshold(uint16_t ms)    { doublePressTime_ = ms; }
+
+  // ── update() ───────────────────────────────────────────────────────────────
+  // Call every loop with the raw pin state.
+  // Returns true if the debounced state changed this cycle.
+  
+  bool update(bool rawState,
+              uint16_t debounceMs = 50,
+              ActiveLevel logic   = ActiveLevel::Low)
+  {
+    if (!initialized_) return false;
+
+    flags_.off(BTN_FLAG_CHANGED);
+
+    const uint32_t now     = millis();
+    const bool     pressed = (logic == ActiveLevel::Low) ? !rawState : rawState;
+
+    // Reject changes within debounce window
+    if ((uint32_t)(now - debounceTs_) < (uint32_t)debounceMs) return false;
+    debounceTs_ = now;
+
+    if (pressed == flags_.read(BTN_FLAG_STATE)) return false;
+
+    // Genuine state change ────────────────────────────────────────────────────
+    flags_.write(BTN_FLAG_STATE,      pressed);
+    flags_.write(BTN_FLAG_CHANGED,    true);
+    flags_.write(BTN_FLAG_HOLD_ARMED, pressed);
+
+    if (pressed) {
+      holdTs_ = now;
+      advanceDblOnPress_(now);
+    } else {
+      advanceDblOnRelease_(now);
+    }
+
+    return true;
   }
 
-  void setDoublePressThreshold(uint16_t t_thres) {
-    doublePressTime = t_thres;
+  // ── updateWithCallback() ───────────────────────────────────────────────────
+  
+  uint8_t updateWithCallback(bool rawState,
+                             uint16_t debounceMs  = 50,
+                             ActiveLevel logic    = ActiveLevel::Low,
+                             uint16_t holdThresh  = NEZA_BTN_HOLD_THRESH,
+                             bool ignoreAfterHold = false)
+  {
+    update(rawState, debounceMs, logic);
+    const uint8_t ev = read(holdThresh, ignoreAfterHold);
+    if (callback_ && ev != NEZA_NONE) callback_(ev);
+    return ev;
   }
 
-  bool update(bool state, uint16_t t_debounce = 50, bool t_logic = LOW) {
-    flags.off(NEZA_BTN_STATE_CHANGED);
+  // ── read() ─────────────────────────────────────────────────────────────────
+  // Returns the current event for this update cycle.
+  // Double-firing when both held() and read() were called.
+  uint8_t read(uint16_t holdThresh  = NEZA_BTN_HOLD_THRESH,
+               bool ignoreAfterHold = false)
+  {
+    if (!initialized_) return NEZA_NONE;
 
-    const uint32_t now = millis();
-    bool pressed = (t_logic == LOW) ? !state : state;
-
-    if ((uint32_t)(now - debounce) >= (uint32_t)t_debounce) {
-      debounce = now;
-      if (pressed != flags.read(NEZA_BTN_STATE)) {
-        holdDebounce = now;
-        flags.write(NEZA_BTN_STATE, pressed);
-        flags.write(NEZA_BTN_STATE_CHANGED, true);
-        flags.write(NEZA_BTN_STATE_HELD, pressed);
-        return true;
+    // ── Hold check (fires once per press, while button is down) ──────────────
+    if (isPressed_() && flags_.read(BTN_FLAG_HOLD_ARMED)) {
+      const uint32_t now = millis();
+      if ((uint32_t)(now - holdTs_) >= (uint32_t)holdThresh) {
+        if (!flags_.read(BTN_FLAG_HOLD_FIRED)) {
+          flags_.on(BTN_FLAG_HOLD_FIRED);
+          flags_.off(BTN_FLAG_HOLD_ARMED);
+          dblState_  = DblState::IDLE;   // cancel pending double
+          lastEvent_ = NEZA_HELD;
+          if (callback_) callback_(NEZA_HELD);
+        }
+        return lastEvent_;
       }
     }
-    return false;
+
+    // ── Edge events (only on state change) ───────────────────────────────────
+    if (!flags_.read(BTN_FLAG_CHANGED)) return lastEvent_;
+
+    // Double-press confirmed
+    if (dblState_ == DblState::CONFIRMED) {
+      dblState_  = DblState::IDLE;
+      lastEvent_ = NEZA_DOUBLE;
+      return lastEvent_;
+    }
+
+    if (isPressed_()) {
+      lastEvent_ = NEZA_PRESSED;
+      return lastEvent_;
+    }
+
+    // Released
+    if (ignoreAfterHold && flags_.read(BTN_FLAG_HOLD_FIRED)) {
+      // Swallow the release that follows a hold event
+      flags_.off(BTN_FLAG_HOLD_FIRED);
+      lastEvent_ = NEZA_NONE;
+      return NEZA_NONE;
+    }
+    flags_.off(BTN_FLAG_HOLD_FIRED);
+    lastEvent_ = NEZA_RELEASED;
+    return lastEvent_;
   }
 
-  void updateWithCallback(bool state,
-                        uint16_t t_debounce = 50,
-                        bool t_logic = LOW,
-                        uint16_t t_hold = NEZA_BTN_HOLD_THRESH,
-                        bool ignoreAfterHold = false)
-{
-  update(state, t_debounce, t_logic);
+  // ── Convenience helpers ───────────────────────────────────────────────────
+  bool getCurrentState() const { return isPressed_(); }
 
-  if (onUpdateCallback) {
-    read(t_hold, ignoreAfterHold);
-  }
-}
+  bool latched()   { return flags_.read(BTN_FLAG_CHANGED) &&  isPressed_(); }
+  bool unlatched() { return flags_.read(BTN_FLAG_CHANGED) && !isPressed_(); }
 
+private:
 
-  uint8_t read(uint16_t t_hold = NEZA_BTN_HOLD_THRESH, bool ignoreAfterHold = false) {
-  if (held(t_hold)) {
-    if (onUpdateCallback) onUpdateCallback(NEZA_HELD);
-    return NEZA_HELD;
-  }
+  // ── Double-press state machine ─────────────────────────────────────────────
+  enum class DblState : uint8_t {
+    IDLE,
+    FIRST_PRESS,
+    WAITING_FOR_SECOND,
+    CONFIRMED,
+  };
 
-  if (stateChanged_()) {
-    if (doublePressed()) {
-      if (onUpdateCallback) onUpdateCallback(NEZA_DOUBLE);
-      return NEZA_DOUBLE;
-    } else if (isPressed_()) {
-      if (onUpdateCallback) onUpdateCallback(NEZA_PRESSED);
-      return NEZA_PRESSED;
-    } else if (released(ignoreAfterHold)) {
-      if (onUpdateCallback) onUpdateCallback(NEZA_RELEASED);
-      return NEZA_RELEASED;
+  // Called on every debounced press edge.
+  void advanceDblOnPress_(uint32_t now) {
+    switch (dblState_) {
+      case DblState::IDLE:
+        dblState_ = DblState::FIRST_PRESS;
+        break;
+
+      case DblState::WAITING_FOR_SECOND:
+        if ((uint32_t)(now - dblWindowTs_) <= (uint32_t)doublePressTime_) {
+          dblState_ = DblState::CONFIRMED;
+        } else {
+          // Window expired — treat this press as a fresh start
+          dblState_ = DblState::FIRST_PRESS;
+        }
+        break;
+
+      case DblState::FIRST_PRESS:
+      case DblState::CONFIRMED:
+        // Shouldn't normally reach here; reset to be safe
+        dblState_ = DblState::FIRST_PRESS;
+        break;
     }
   }
 
-  return NEZA_NONE;
-}
-
-  bool doublePressed(bool allowRelease = false) {
-    bool state = flags.toggleIfTrue(NEZA_BTN_STATE_DBL_TRIGGERED);
-    if (state && !allowRelease) {
-      flags.on(NEZA_BTN_STATE_DBL_IGNORE_REL);
+  // Called on every debounced release edge.
+  void advanceDblOnRelease_(uint32_t now) {
+    if (dblState_ == DblState::FIRST_PRESS) {
+      dblState_    = DblState::WAITING_FOR_SECOND;
+      dblWindowTs_ = now;   // start timing the window from release
     }
-    return state;
   }
 
-  bool pressed() {
-    const uint32_t now = millis();
-    bool state = stateChanged_() && isPressed_();
-    if (state) {
-      if (setDblPress_(now)) return false;
-    }
-    return state;
-  }
+  // ── Private helpers ───────────────────────────────────────────────────────
+  bool isPressed_()  const { return flags_.read(BTN_FLAG_STATE);   }
 
-  bool released(bool ignoreAfterHold = false) {
-    const uint32_t now = millis();
-    bool state = stateChanged_() && !isPressed_();
+  // ── Members ───────────────────────────────────────────────────────────────
+  HC165_Flags<uint8_t> flags_;
 
-    bool holdTriggered = flags.read(NEZA_BTN_STATE_HOLD_TRIGGERED);
-    bool dblTriggered  = flags.read(NEZA_BTN_STATE_DBL_IGNORE_REL);
+  DblState dblState_        = DblState::IDLE;
+  uint32_t debounceTs_      = 0;
+  uint32_t holdTs_          = 0;
+  uint32_t dblWindowTs_     = 0;
+  uint16_t doublePressTime_ = NEZA_BTN_DBL_DEFAULT;
+  uint8_t  lastEvent_       = NEZA_NONE;
+  bool     initialized_     = false;
 
-    if (state) {
-      flags.off(NEZA_BTN_STATE_HOLD_TRIGGERED);
-      flags.off(NEZA_BTN_STATE_DBL_IGNORE_REL);
-    }
-
-    if (state && ignoreAfterHold && holdTriggered) {
-      return false;
-    }
-
-    if (state) {
-      setDblRelease_(now);
-      if (dblTriggered) return false;
-    }
-    return state;
-  }
-
-  bool held(uint16_t holdTime = NEZA_BTN_HOLD_THRESH) {
-    const uint32_t now = millis();
-    bool state = isPressed_() && btnHeld_() && ((uint32_t)(now - holdDebounce) >= (uint32_t)holdTime);
-
-    if (state && !flags.read(NEZA_BTN_STATE_HOLD_TRIGGERED)) {
-      flags.on(NEZA_BTN_STATE_HOLD_TRIGGERED);
-      flags.off(NEZA_BTN_STATE_DBL_ACTIVE);
-      return true;
-    }
-    return false;
-  }
-
-  bool latched()   { return stateChanged_() &&  isPressed_(); }
-  bool unlatched() { return stateChanged_() && !isPressed_(); }
-  bool getCurrentState() { return isPressed_(); }
+  void (*callback_)(uint8_t type) = nullptr;
 };
 
 #endif // Neza74HC165_h
-
-
-
