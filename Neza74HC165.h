@@ -245,28 +245,30 @@ enum class ActiveLevel : uint8_t {
 
 class HC165_Button {
 public:
-
-  // ── Lifecycle ──────────────────────────────────────────────────────────────
   HC165_Button() = default;
 
   void begin() {
     flags_.reset();
-    dblState_      = DblState::IDLE;
-    debounceTs_    = millis();
-    holdTs_        = 0;
-    dblWindowTs_   = 0;
-    lastEvent_     = NEZA_NONE;
-    initialized_   = true;
+
+    clickState_       = ClickState::IDLE;
+    rawChangeTs_      = millis();
+    holdTs_           = 0;
+    firstReleaseTs_   = 0;
+    pendingEvent_     = NEZA_NONE;
+
+    initialized_      = true;
+    rawSeeded_        = false;
+    lastRawPressed_   = false;
   }
 
-  // ── Configuration ──────────────────────────────────────────────────────────
   void setOnUpdate(void (*fptr)(uint8_t type)) { callback_ = fptr; }
-  void setDoublePressThreshold(uint16_t ms)    { doublePressTime_ = ms; }
 
-  // ── update() ───────────────────────────────────────────────────────────────
-  // Call every loop with the raw pin state.
-  // Returns true if the debounced state changed this cycle.
-  
+  // Double-click window in ms.
+  // If > 0, single click (NEZA_PRESSED) is delayed until this window expires.
+  void setDoublePressThreshold(uint16_t ms) { doublePressTime_ = ms; }
+
+  // Debounce + state update
+  // Returns true only when the debounced physical state changes
   bool update(bool rawState,
               uint16_t debounceMs = 50,
               ActiveLevel logic   = ActiveLevel::Low)
@@ -275,32 +277,106 @@ public:
 
     flags_.off(BTN_FLAG_CHANGED);
 
-    const uint32_t now     = millis();
-    const bool     pressed = (logic == ActiveLevel::Low) ? !rawState : rawState;
+    const uint32_t now = millis();
+    const bool pressed = (logic == ActiveLevel::Low) ? !rawState : rawState;
 
-    // Reject changes within debounce window
-    if ((uint32_t)(now - debounceTs_) < (uint32_t)debounceMs) return false;
-    debounceTs_ = now;
+    // First sample: seed raw state, don't generate fake events
+    if (!rawSeeded_) {
+      rawSeeded_      = true;
+      lastRawPressed_ = pressed;
+      rawChangeTs_    = now;
+      return false;
+    }
 
-    if (pressed == flags_.read(BTN_FLAG_STATE)) return false;
+    // Raw changed -> restart debounce timer
+    if (pressed != lastRawPressed_) {
+      lastRawPressed_ = pressed;
+      rawChangeTs_    = now;
+      return false;
+    }
 
-    // Genuine state change ────────────────────────────────────────────────────
-    flags_.write(BTN_FLAG_STATE,      pressed);
-    flags_.write(BTN_FLAG_CHANGED,    true);
-    flags_.write(BTN_FLAG_HOLD_ARMED, pressed);
+    // Not stable long enough yet
+    if ((uint32_t)(now - rawChangeTs_) < (uint32_t)debounceMs) {
+      return false;
+    }
+
+    // No debounced state change
+    if (pressed == isPressed_()) {
+      return false;
+    }
+
+    // If a previous single click was waiting and the window already expired,
+    // confirm it now before starting a new click sequence.
+    if (doublePressTime_ > 0 &&
+        clickState_ == ClickState::WAIT_SECOND &&
+        (uint32_t)(now - firstReleaseTs_) > (uint32_t)doublePressTime_) {
+      queueEvent_(NEZA_PRESSED);   // confirmed single click
+      clickState_ = ClickState::IDLE;
+    }
+
+    // ---------------- Genuine debounced edge ----------------
+    flags_.write(BTN_FLAG_STATE,   pressed);
+    flags_.write(BTN_FLAG_CHANGED, true);
 
     if (pressed) {
       holdTs_ = now;
-      advanceDblOnPress_(now);
+      flags_.on(BTN_FLAG_HOLD_ARMED);
+      flags_.off(BTN_FLAG_HOLD_FIRED);
+
+      if (doublePressTime_ == 0) {
+        // Immediate edge mode (double-click disabled)
+        queueEvent_(NEZA_PRESSED);
+        clickState_ = ClickState::IDLE;
+      } else {
+        // Double-click enabled
+        if (clickState_ == ClickState::WAIT_SECOND &&
+            (uint32_t)(now - firstReleaseTs_) <= (uint32_t)doublePressTime_) {
+          // Second press started within double-click window
+          clickState_ = ClickState::SECOND_DOWN;
+        } else {
+          // Start first click
+          clickState_ = ClickState::FIRST_DOWN;
+        }
+      }
     } else {
-      advanceDblOnRelease_(now);
+      // Release edge
+      flags_.off(BTN_FLAG_HOLD_ARMED);
+
+      // Release after a hold
+      if (flags_.read(BTN_FLAG_HOLD_FIRED)) {
+        queueEvent_(NEZA_RELEASED);
+        clickState_ = ClickState::IDLE;
+        return true;
+      }
+
+      if (doublePressTime_ == 0) {
+        // Immediate edge mode (double-click disabled)
+        queueEvent_(NEZA_RELEASED);
+        clickState_ = ClickState::IDLE;
+      } else {
+        // Double-click enabled
+        if (clickState_ == ClickState::FIRST_DOWN) {
+          // First click finished -> wait for second click
+          clickState_     = ClickState::WAIT_SECOND;
+          firstReleaseTs_ = now;
+          // No event yet: must wait to know single vs double
+        }
+        else if (clickState_ == ClickState::SECOND_DOWN &&
+                 (uint32_t)(now - firstReleaseTs_) <= (uint32_t)doublePressTime_) {
+          // Valid second click completed in time
+          queueEvent_(NEZA_DOUBLE);
+          clickState_ = ClickState::IDLE;
+        }
+        else {
+          // Fallback/reset
+          clickState_ = ClickState::IDLE;
+        }
+      }
     }
 
     return true;
   }
 
-  // ── updateWithCallback() ───────────────────────────────────────────────────
-  
   uint8_t updateWithCallback(bool rawState,
                              uint16_t debounceMs  = 50,
                              ActiveLevel logic    = ActiveLevel::Low,
@@ -309,121 +385,111 @@ public:
   {
     update(rawState, debounceMs, logic);
     const uint8_t ev = read(holdThresh, ignoreAfterHold);
-    if (callback_ && ev != NEZA_NONE) callback_(ev);
+
+    if (callback_ && ev != NEZA_NONE) {
+      callback_(ev);
+    }
+
     return ev;
   }
 
-  // ── read() ─────────────────────────────────────────────────────────────────
-  // Returns the current event for this update cycle.
-  // Double-firing when both held() and read() were called.
+  // Returns one-shot event:
+  //   NEZA_NONE / NEZA_PRESSED / NEZA_RELEASED / NEZA_HELD / NEZA_DOUBLE
   uint8_t read(uint16_t holdThresh  = NEZA_BTN_HOLD_THRESH,
                bool ignoreAfterHold = false)
   {
     if (!initialized_) return NEZA_NONE;
 
-    // ── Hold check (fires once per press, while button is down) ──────────────
-    if (isPressed_() && flags_.read(BTN_FLAG_HOLD_ARMED)) {
-      const uint32_t now = millis();
+    const uint32_t now = millis();
+
+    // ---------------- Hold detection ----------------
+    if (isPressed_() &&
+        flags_.read(BTN_FLAG_HOLD_ARMED) &&
+        !flags_.read(BTN_FLAG_HOLD_FIRED))
+    {
       if ((uint32_t)(now - holdTs_) >= (uint32_t)holdThresh) {
-        if (!flags_.read(BTN_FLAG_HOLD_FIRED)) {
-          flags_.on(BTN_FLAG_HOLD_FIRED);
-          flags_.off(BTN_FLAG_HOLD_ARMED);
-          dblState_  = DblState::IDLE;   // cancel pending double
-          lastEvent_ = NEZA_HELD;
-          if (callback_) callback_(NEZA_HELD);
-        }
-        return lastEvent_;
+        flags_.on(BTN_FLAG_HOLD_FIRED);
+        flags_.off(BTN_FLAG_HOLD_ARMED);
+
+        // Cancel any click/double waiting state
+        clickState_ = ClickState::IDLE;
+
+        queueEvent_(NEZA_HELD);
       }
     }
 
-    // ── Edge events (only on state change) ───────────────────────────────────
-    if (!flags_.read(BTN_FLAG_CHANGED)) return lastEvent_;
-
-    // Double-press confirmed
-    if (dblState_ == DblState::CONFIRMED) {
-      dblState_  = DblState::IDLE;
-      lastEvent_ = NEZA_DOUBLE;
-      return lastEvent_;
+    // ---------------- Single-click confirmation timeout ----------------
+    if (doublePressTime_ > 0 &&
+        clickState_ == ClickState::WAIT_SECOND &&
+        (uint32_t)(now - firstReleaseTs_) > (uint32_t)doublePressTime_) {
+      queueEvent_(NEZA_PRESSED);   // confirmed single click
+      clickState_ = ClickState::IDLE;
     }
 
-    if (isPressed_()) {
-      lastEvent_ = NEZA_PRESSED;
-      return lastEvent_;
-    }
-
-    // Released
-    if (ignoreAfterHold && flags_.read(BTN_FLAG_HOLD_FIRED)) {
-      // Swallow the release that follows a hold event
-      flags_.off(BTN_FLAG_HOLD_FIRED);
-      lastEvent_ = NEZA_NONE;
+    if (pendingEvent_ == NEZA_NONE) {
       return NEZA_NONE;
     }
-    flags_.off(BTN_FLAG_HOLD_FIRED);
-    lastEvent_ = NEZA_RELEASED;
-    return lastEvent_;
+
+    const uint8_t ev = pendingEvent_;
+    pendingEvent_ = NEZA_NONE;
+
+    // Optional: swallow the release after a hold
+    if (ignoreAfterHold &&
+        ev == NEZA_RELEASED &&
+        flags_.read(BTN_FLAG_HOLD_FIRED))
+    {
+      flags_.off(BTN_FLAG_HOLD_FIRED);
+      return NEZA_NONE;
+    }
+
+    // Clear hold flag once release is consumed
+    if (ev == NEZA_RELEASED) {
+      flags_.off(BTN_FLAG_HOLD_FIRED);
+    }
+
+    return ev;
   }
 
-  // ── Convenience helpers ───────────────────────────────────────────────────
+  // Current debounced physical state (true = physically pressed)
   bool getCurrentState() const { return isPressed_(); }
 
-  bool latched()   { return flags_.read(BTN_FLAG_CHANGED) &&  isPressed_(); }
-  bool unlatched() { return flags_.read(BTN_FLAG_CHANGED) && !isPressed_(); }
+  // Physical edge helpers (valid after update, before next update)
+  bool latched() const   { return flags_.read(BTN_FLAG_CHANGED) &&  isPressed_(); }
+  bool unlatched() const { return flags_.read(BTN_FLAG_CHANGED) && !isPressed_(); }
 
 private:
-
-  // ── Double-press state machine ─────────────────────────────────────────────
-  enum class DblState : uint8_t {
+  enum class ClickState : uint8_t {
     IDLE,
-    FIRST_PRESS,
-    WAITING_FOR_SECOND,
-    CONFIRMED,
+    FIRST_DOWN,   // first press is currently down
+    WAIT_SECOND,  // first click finished; waiting for second click
+    SECOND_DOWN   // second press is currently down
   };
 
-  // Called on every debounced press edge.
-  void advanceDblOnPress_(uint32_t now) {
-    switch (dblState_) {
-      case DblState::IDLE:
-        dblState_ = DblState::FIRST_PRESS;
-        break;
+  bool isPressed_() const { return flags_.read(BTN_FLAG_STATE); }
 
-      case DblState::WAITING_FOR_SECOND:
-        if ((uint32_t)(now - dblWindowTs_) <= (uint32_t)doublePressTime_) {
-          dblState_ = DblState::CONFIRMED;
-        } else {
-          // Window expired — treat this press as a fresh start
-          dblState_ = DblState::FIRST_PRESS;
-        }
-        break;
-
-      case DblState::FIRST_PRESS:
-      case DblState::CONFIRMED:
-        // Shouldn't normally reach here; reset to be safe
-        dblState_ = DblState::FIRST_PRESS;
-        break;
+  void queueEvent_(uint8_t ev) {
+    // Keep first pending event until user consumes it with read()
+    if (pendingEvent_ == NEZA_NONE) {
+      pendingEvent_ = ev;
     }
   }
 
-  // Called on every debounced release edge.
-  void advanceDblOnRelease_(uint32_t now) {
-    if (dblState_ == DblState::FIRST_PRESS) {
-      dblState_    = DblState::WAITING_FOR_SECOND;
-      dblWindowTs_ = now;   // start timing the window from release
-    }
-  }
-
-  // ── Private helpers ───────────────────────────────────────────────────────
-  bool isPressed_()  const { return flags_.read(BTN_FLAG_STATE);   }
-
-  // ── Members ───────────────────────────────────────────────────────────────
+private:
   HC165_Flags<uint8_t> flags_;
 
-  DblState dblState_        = DblState::IDLE;
-  uint32_t debounceTs_      = 0;
-  uint32_t holdTs_          = 0;
-  uint32_t dblWindowTs_     = 0;
-  uint16_t doublePressTime_ = NEZA_BTN_DBL_DEFAULT;
-  uint8_t  lastEvent_       = NEZA_NONE;
-  bool     initialized_     = false;
+  ClickState clickState_      = ClickState::IDLE;
+
+  uint32_t rawChangeTs_       = 0;  // raw input changed at
+  uint32_t holdTs_            = 0;  // current press started at
+  uint32_t firstReleaseTs_    = 0;  // first click release time
+
+  uint16_t doublePressTime_   = NEZA_BTN_DBL_DEFAULT;
+
+  uint8_t pendingEvent_       = NEZA_NONE;
+
+  bool initialized_           = false;
+  bool rawSeeded_             = false;
+  bool lastRawPressed_        = false;
 
   void (*callback_)(uint8_t type) = nullptr;
 };
