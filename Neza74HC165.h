@@ -9,6 +9,13 @@
 // Neza74HC165 Library
 //
 // GPIO bit-banged 74HC165 chain reader.
+// 1 chip = 8 inputs.
+//
+// Examples:
+//   Neza74HC165<1> = 1 chip  = 8 inputs
+//   Neza74HC165<2> = 2 chips = 16 inputs
+//   Neza74HC165<3> = 3 chips = 24 inputs
+//
 // Includes HC165_Button helper for debounce, press, release, hold and double.
 // ============================================================================
 
@@ -17,8 +24,8 @@
 //
 // You can override before including this file:
 //
-// #define NEZA_74HC165_DELAY_HIGH 0
-// #define NEZA_74HC165_DELAY_LOW  0
+//   #define NEZA_74HC165_DELAY_HIGH 0
+//   #define NEZA_74HC165_DELAY_LOW  0
 //
 // Default is safe and stable for most boards.
 // ============================================================================
@@ -40,8 +47,8 @@
 //
 // To enable:
 //
-// #define NEZA_USE_ESP32_FAST_GPIO
-// #include "Neza74HC165.h"
+//   #define NEZA_USE_ESP32_FAST_GPIO
+//   #include "Neza74HC165.h"
 // ============================================================================
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(NEZA_USE_ESP32_FAST_GPIO)
@@ -171,16 +178,26 @@ public:
 // ============================ Neza74HC165 ====================================
 //
 // Template argument:
-//   _muxCount = number of physical 74HC165 chips.
-//   1 chip = 8 inputs.
+//
+//   CHIP_COUNT = number of physical 74HC165 chips.
+//
+// Meaning:
+//
+//   Neza74HC165<1> = 1 chip  = 8 inputs
+//   Neza74HC165<2> = 2 chips = 16 inputs
+//   Neza74HC165<3> = 3 chips = 24 inputs
+//
 // ============================================================================
 
-template <size_t _muxCount>
+template <size_t CHIP_COUNT>
 class Neza74HC165 {
-  static_assert(_muxCount > 0, "_muxCount must be greater than 0");
-  static_assert(_muxCount <= 255, "_muxCount too large");
+  static_assert(CHIP_COUNT > 0, "CHIP_COUNT must be greater than 0");
+  static_assert(CHIP_COUNT <= 255, "CHIP_COUNT too large");
 
 public:
+  static constexpr size_t chip_count = CHIP_COUNT;
+  static constexpr size_t pin_count  = CHIP_COUNT * 8u;
+
   enum class BitOrder : uint8_t {
     MSB_FIRST = 0,
     LSB_FIRST = 1
@@ -204,7 +221,7 @@ private:
 
   bool initialized_ = false;
 
-  uint8_t states_[_muxCount] = {};
+  uint8_t states_[CHIP_COUNT] = {};
 
 private:
   bool pinsAreUnique_(uint8_t data, uint8_t load, uint8_t clk) const {
@@ -222,6 +239,7 @@ private:
 public:
   Neza74HC165() = default;
 
+  // begin(dataPin/Q7, loadPin//PL, clkPin/CP, bitOrder, logic)
   bool begin(uint8_t t_data,
              uint8_t t_load,
              uint8_t t_clk,
@@ -251,12 +269,13 @@ public:
 
     initialized_ = true;
 
+    // Capture initial real state.
     update();
 
     return true;
   }
 
-  // Optional clock inhibit pin version.
+  // begin with optional clock inhibit pin.
   // If used, inhibit pin is driven LOW to allow clocking.
   bool begin(uint8_t t_data,
              uint8_t t_load,
@@ -292,6 +311,7 @@ public:
 
     initialized_ = true;
 
+    // Capture initial real state.
     update();
 
     return true;
@@ -310,13 +330,20 @@ public:
   }
 
   size_t chipCount() const {
-    return _muxCount;
+    return chip_count;
   }
 
+  size_t pinCount() const {
+    return pin_count;
+  }
+
+  // Backward-compatible name.
   uint16_t getLength() const {
-    return static_cast<uint16_t>(_muxCount * 8u);
+    return static_cast<uint16_t>(pin_count);
   }
 
+  // Latch and shift all chips.
+  // Call once per loop before reading inputs.
   void update() {
     if (!initialized_) return;
 
@@ -324,7 +351,7 @@ public:
       neza_gpio_set_level(inhibitPin_, LOW);
     }
 
-    // Parallel load.
+    // Parallel load: /PL LOW briefly, then HIGH.
     neza_gpio_set_level(loadPin_, LOW);
 
 #if NEZA_74HC165_LATCH_PULSE_US > 0
@@ -333,7 +360,7 @@ public:
 
     neza_gpio_set_level(loadPin_, HIGH);
 
-    for (size_t mux = 0; mux < _muxCount; mux++) {
+    for (size_t chip = 0; chip < CHIP_COUNT; chip++) {
       uint8_t value = 0;
 
       for (int8_t i = 7; i >= 0; i--) {
@@ -365,12 +392,14 @@ public:
 #endif
       }
 
-      states_[mux] = value;
+      states_[chip] = value;
     }
   }
 
+  // Read bit n across the full chain.
+  // n = 0..pin_count-1.
   bool read(uint16_t n) const {
-    if (n >= getLength()) return false;
+    if (n >= pin_count) return false;
 
     return ((states_[n >> 3] >> (n & 0x07)) & 0x01) != 0;
   }
@@ -379,13 +408,15 @@ public:
     return read(n);
   }
 
+  // Raw byte for chip index.
   uint8_t readByte(size_t chip) const {
-    if (chip >= _muxCount) return 0;
+    if (chip >= CHIP_COUNT) return 0;
     return states_[chip];
   }
 
+  // Helper for reversed bit direction.
   uint8_t readByteReversed(size_t chip) const {
-    if (chip >= _muxCount) return 0;
+    if (chip >= CHIP_COUNT) return 0;
 
     uint8_t v = states_[chip];
 
@@ -396,9 +427,12 @@ public:
     return v;
   }
 
+  // Returns up to first 4 chips packed into uint32_t.
+  // Chip 0 goes into bits 0..7.
+  // Chip 1 goes into bits 8..15.
   uint32_t readUInt32() const {
     uint32_t value = 0;
-    const size_t maxBytes = _muxCount > 4 ? 4 : _muxCount;
+    const size_t maxBytes = CHIP_COUNT > 4 ? 4 : CHIP_COUNT;
 
     for (size_t i = 0; i < maxBytes; i++) {
       value |= static_cast<uint32_t>(states_[i]) << (i * 8u);
@@ -413,19 +447,27 @@ public:
 };
 
 
-// Each HC165_165<N> manages N*2 physical 74HC165 chips.
-// Example:
-// HC165_165<1> = 2 chips = 16 inputs.
-// HC165_165<2> = 4 chips = 32 inputs.
+// Optional short alias.
+// HC165<1> means exactly 1 physical 74HC165 chip = 8 inputs.
+// HC165<2> means exactly 2 physical 74HC165 chips = 16 inputs.
 
-template <size_t _muxinCount>
-class HC165_165 : public Neza74HC165<_muxinCount * 2u> {
-  static_assert(_muxinCount > 0, "_muxinCount must be greater than 0");
-  static_assert((_muxinCount * 2u) <= 255, "_muxinCount too large");
-};
+template <size_t CHIP_COUNT>
+using HC165 = Neza74HC165<CHIP_COUNT>;
 
 
 // ============================ HC165_Button ===================================
+//
+// Button/input helper with:
+//   - debounce
+//   - press/click event
+//   - release event
+//   - hold event
+//   - double-click event
+//
+// For PIR sensors, use:
+//   setDoublePressThreshold(0);
+//
+// ============================================================================
 
 #ifndef NEZA_BTN_HOLD_THRESH
 #define NEZA_BTN_HOLD_THRESH 500
@@ -442,7 +484,8 @@ class HC165_165 : public Neza74HC165<_muxinCount * 2u> {
 #define NEZA_HELD      3
 #define NEZA_DOUBLE    4
 
-// Alias because with double-click enabled, NEZA_PRESSED means confirmed click.
+// Alias because with double-click enabled,
+// NEZA_PRESSED means confirmed single click.
 #define NEZA_CLICK     NEZA_PRESSED
 
 
@@ -457,8 +500,8 @@ enum class HC165_ButtonEvent : uint8_t {
 
 
 enum class ActiveLevel : uint8_t {
-  Low = 0,
-  High = 1
+  Low = 0,   // raw LOW means active/pressed
+  High = 1   // raw HIGH means active/pressed
 };
 
 
@@ -516,6 +559,7 @@ public:
     const bool pressed = logic == ActiveLevel::Low ? !rawState : rawState;
 
     // First sample only seeds raw state.
+    // This avoids fake startup events.
     if (!rawSeeded_) {
       rawSeeded_ = true;
       lastRawPressed_ = pressed;
@@ -523,7 +567,7 @@ public:
       return false;
     }
 
-    // Raw changed, restart debounce timer.
+    // Raw state changed. Restart debounce timer.
     if (pressed != lastRawPressed_) {
       lastRawPressed_ = pressed;
       rawChangeTs_ = now;
@@ -540,7 +584,8 @@ public:
       return false;
     }
 
-    // If a single click was waiting and timeout expired, confirm it now.
+    // If a previous single click was waiting and timeout expired,
+    // confirm it before starting another sequence.
     if (doublePressTime_ > 0 &&
         clickState_ == ClickState::WAIT_SECOND &&
         (uint32_t)(now - firstReleaseTs_) > (uint32_t)doublePressTime_) {
@@ -734,7 +779,7 @@ private:
 
     const uint8_t next = static_cast<uint8_t>((eventHead_ + 1u) % EVENT_QUEUE_SIZE);
 
-    // Queue full: drop newest event to avoid overwriting unread event.
+    // Queue full: drop newest event to avoid overwriting unread events.
     if (next == eventTail_) {
       return;
     }
